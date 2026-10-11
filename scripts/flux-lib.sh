@@ -19,7 +19,10 @@ FLUX_MODS_DIR="${FLUX_MODS_DIR:-${FLUX_DATA_DIR}/Mods}"
 FLUX_STATE_DIR="${FLUX_STATE_DIR:-${FLUX_DATA_DIR}/flux}"
 FLUX_LOG="${FLUX_LOG:-${FLUX_STATE_DIR}/flux.log}"
 FLUX_LOG_MAX_LINES="${FLUX_LOG_MAX_LINES:-2000}"
-FLUX_GAME_LOG_DIR="${FLUX_GAME_LOG_DIR:-${FLUX_STATE_DIR}/logs}"
+# The game's logs are on the INSTALL volume (local, never synced): the server writes leak warnings
+# into its log for as long as it runs. The current one is capped at FLUX_GAME_LOG_MAX_BYTES.
+FLUX_GAME_LOG_DIR="${FLUX_GAME_LOG_DIR:-${FLUX_SERVER_DIR}/flux-logs}"
+FLUX_GAME_LOG_MAX_BYTES="${FLUX_GAME_LOG_MAX_BYTES:-52428800}"
 FLUX_GAME_LOG_KEEP="${FLUX_GAME_LOG_KEEP:-10}"
 FLUX_BACKUP_DIR="${FLUX_BACKUP_DIR:-${FLUX_STATE_DIR}/backups}"
 FLUX_GAME_PROCESS="${FLUX_GAME_PROCESS:-CoreKeeperServer}"
@@ -172,9 +175,17 @@ flux_public_build() {
 
 # The game's own log of the current generation (the supervisor passes it with -logfile).
 flux_game_log() {
-  printf '%s' "${FLUX_STATE_DIR}/current.log"
+  printf '%s' "${FLUX_GAME_LOG:-${FLUX_GAME_LOG_DIR}/current.log}"
 }
 
 flux_game_pid() {
   pgrep -f "^\./${FLUX_GAME_PROCESS} " 2>/dev/null | head -1
+}
+
+# $1 = the restart marker. Prints the earliest epoch the server may be stopped for it (the panel's
+# request waits for a new world to settle), 0 when it says nothing.
+flux_marker_not_before() {
+  local value
+  value="$(sed -n 's/^notbefore=//p' "$1" 2>/dev/null | head -1)"
+  [[ "${value}" =~ ^[0-9]+$ ]] && printf '%s' "${value}" || printf '0'
 }

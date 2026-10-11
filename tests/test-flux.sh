@@ -64,7 +64,8 @@ data="${tmp}/data"
 ck() { # VAR=value... command args: fluxck.py with exactly these variables
   local vars=()
   while [[ "${1:-}" == *=* ]]; do vars+=("$1"); shift; done
-  env -i PATH="${PATH}" FLUX_DATA_DIR="${data}" FLUX_SERVER_DIR="${tmp}/server" "${vars[@]}" python3 scripts/fluxck.py "$@"
+  env -i PATH="${PATH}" FLUX_DATA_DIR="${data}" FLUX_SERVER_DIR="${tmp}/server" FLUX_ROSTER_CACHE="${tmp}/roster.json" \
+    FLUX_RESTART_MARKER="${tmp}/restart-marker" "${vars[@]}" python3 scripts/fluxck.py "$@"
 }
 jget() { python3 -c 'import json,sys
 d=json.load(open(sys.argv[1]))
@@ -144,7 +145,9 @@ check "admins print their SteamID64 as a string (above 2^53)" "str" "$(ck admins
 check "lifting a ban keeps the others" "76561198000000008" "$(jget "${data}/DedicatedServer/PlayerBans.json" banList.0.steamId)"
 
 # The roster, from log lines in the game's own format.
-cat >"${data}/flux/current.log" <<'EOF'
+log="${tmp}/server/flux-logs/current.log"
+mkdir -p "$(dirname "${log}")"
+cat >"${log}" <<'EOF'
 Started session with info: 1.2.3.4;27015;rRwVS7A957ZWPnA;secret
 [userid:76561198000000001] player Alice connected islocalplayer=False
 [userid:3203127215] player Bob The Miner connected islocalplayer=False
@@ -154,8 +157,20 @@ EOF
 check "the roster has who is on" "Bob The Miner" "$(ck status | python3 -c 'import json,sys;print(",".join(p["name"] for p in json.load(sys.stdin)["players"]))')"
 check "the address comes from the session" "27015 secret" "$(ck connect | python3 -c 'import json,sys;d=json.load(sys.stdin);print(d["port"], d["password"])')"
 check "players seen are remembered" "Bob The Miner" "$(jget "${data}/flux/players-seen.json" 3203127215.name)"
-printf 'Started session with info: rRwVS7A957ZWPnA\n' >"${data}/flux/current.log"
-check "relay mode is not direct" "False rRwVS7A957ZWPnA" "$(ck connect | python3 -c 'import json,sys;d=json.load(sys.stdin);print(d["direct"], d["gameId"])')"
+printf 'Started session with info: rRwVS7A957ZWPnA\n' >"${log}"
+check "relay mode is not direct" "False rRwVS7A957ZWPnA" "$(ck CK_PORT=relay connect | python3 -c 'import json,sys;d=json.load(sys.stdin);print(d["direct"], d["gameId"])')"
+check "direct comes from CK_PORT, not the log" "True" "$(ck status | python3 -c 'import json,sys;print(json.load(sys.stdin)["direct"])')"
+
+# The roster reads only what the log gained.
+printf 'Started session with info: 1.2.3.4;27015;rRwVS7A957ZWPnA;secret\n[userid:76561198000000001] player Alice connected islocalplayer=False\n' >"${log}"
+ck status >/dev/null
+printf '[userid:76561198000000002] player Carol connected islocalplayer=False\n' >>"${log}"
+check "lines added later are read" "Alice,Carol" "$(ck status | python3 -c 'import json,sys;print(",".join(sorted(p["name"] for p in json.load(sys.stdin)["players"])))')"
+check "the cache keeps its place" "1" "$(python3 -c 'import json,sys,os;c=json.load(open(sys.argv[1]));print(int(c["offset"]==os.path.getsize(sys.argv[2])))' "${tmp}/roster.json" "${log}")"
+printf 'Started session with info: rRwVS7A957ZWPnA\n' >"${log}"
+check "a shorter log starts over" "" "$(ck status | python3 -c 'import json,sys;print(",".join(p["name"] for p in json.load(sys.stdin)["players"]))')"
+printf '[userid:3] player Half' >>"${log}"
+check "a line still being written is not read" "" "$(ck status | python3 -c 'import json,sys;print(",".join(p["name"] for p in json.load(sys.stdin)["players"]))')"
 
 # Mods.
 mkdir -p "${tmp}/zip/CoolMod/Assets"
@@ -184,6 +199,93 @@ check "image 1.0.0's renamed mods are moved out" "OldStyle False" "$(ck mods | p
 check "a dotted name is refused" "2" "$(status ck mod-remove '.flux-x')"
 check "removing a mod" "0" "$(status ck mod-remove CoolMod)"
 check "removes it" "1" "$(status test -d "${data}/Mods/CoolMod")"
+
+# --- 1.0.2 --------------------------------------------------------------------------------------
+
+# An empty env value is unset: the marketplace writes blank parameters as NAME=.
+ck set-settings '{"world": 4}' >/dev/null
+ck CK_WORLD= CK_WORLD_NAME= apply >/dev/null
+check "an empty CK_WORLD leaves the panel's world" "4" "$(jget "${cfg}" world)"
+check "an empty name keeps the name" "1" "$(python3 -c 'import json,sys;print(int(bool(json.load(open(sys.argv[1]))["worldName"])))' "${cfg}")"
+ck set-settings '{"world": null}' >/dev/null
+
+check "a Game ID with Y is refused" "2" "$(status ck set-settings '{"gameId": "ABCDEFGHJKLMNPQRSTUVY"}')"
+check "a password with ; is refused" "2" "$(status ck set-settings '{"password": "ab;cd"}')"
+check "an env password loses its ;" "abcd" "$(ck CK_PASSWORD='ab;cd' apply >/dev/null; jget "${cfg}" password)"
+
+# The content bundles from the panel: once, for the world being loaded.
+ck set-settings '{"activateAllContent": true}' >/dev/null
+check "the first start gets them" "1" "$(ck apply | grep -cx -- '-activateallcontent')"
+check "the next does not" "0" "$(ck apply | grep -cx -- '-activateallcontent')"
+check "and the world is remembered" "1" "$(python3 -c 'import json,sys;print(len(json.load(open(sys.argv[1]))["contentActivated"]))' "${data}/flux/settings.json")"
+check "CK_ACTIVATE_ALL_CONTENT is every start" "1" "$(ck CK_ACTIVATE_ALL_CONTENT=true apply | grep -cx -- '-activateallcontent')"
+
+# Admins from other PC stores (steamId 0, a crossPlatformId) and entries the panel cannot name.
+printf '{"adminList": [{"index": 1, "privileges": 2, "name": "EpicGuy", "steamId": 0, "crossPlatformId": 3203127215}, {"index": 2, "name": "?"}, {"index": 3, "privileges": 2, "name": "S", "steamId": 76561198000000003, "crossPlatformId": 0}]}' >"${data}/DedicatedServer/Admins.json"
+check "a cross-platform admin has a key" "cp:3203127215" "$(ck admins | python3 -c 'import json,sys;print(json.load(sys.stdin)["admins"][0]["key"])')"
+check "the panel may send it" "0" "$(status ck set-admins '{"admins": ["cp:3203127215", "76561198000000004"]}')"
+ck apply >/dev/null
+check "kept: the cross-platform admin, the unnamed entry and the new one" "EpicGuy,?,76561198000000004" "$(python3 -c 'import json,sys;print(",".join(a.get("name") or str(a.get("steamId")) for a in json.load(open(sys.argv[1]))["adminList"]))' "${data}/DedicatedServer/Admins.json")"
+check "a SteamID64 above 2^53 survives" "76561198000000004" "$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["adminList"][2]["steamId"])' "${data}/DedicatedServer/Admins.json")"
+
+# Bans by SteamID64, in the shape the server keeps (measured: it adds `index` itself).
+printf '{"banList": []}' >"${data}/DedicatedServer/PlayerBans.json"
+ck set-admins '{"bans": ["76561198000000009"]}' >/dev/null
+ck apply >/dev/null
+check "a ban by SteamID64" "76561198000000009 0" "$(python3 -c 'import json,sys;b=json.load(open(sys.argv[1]))["banList"][0];print(b["steamId"], b["crossPlatformId"])' "${data}/DedicatedServer/PlayerBans.json")"
+check "an admins edit keeps a pending bans edit" "2" "$(ck set-admins '{"bans": ["76561198000000008"]}' >/dev/null; ck set-admins '{"admins": []}' >/dev/null; python3 -c 'import json,sys;print(len(json.load(open(sys.argv[1]))))' "${data}/flux/admins-pending.json")"
+ck apply >/dev/null
+
+# Backups: skipped when one is young, kept by the rules, restored on the next start.
+mkdir -p "${data}/DedicatedServer/worlds" && echo w0 >"${data}/DedicatedServer/worlds/0.world.gzip"
+check "a first backup" "1" "$(ck backup start | grep -c 'backup (start): flux/backups/')"
+check "a second within the hour is skipped" "1" "$(ck backup start | grep -c 'skipped')"
+check "unless forced" "1" "$(sleep 1; ck backup panel force | grep -c 'backup (panel)')"
+check "the list says why" "panel start" "$(ck backups | python3 -c 'import json,sys;print(" ".join(b["why"] for b in json.load(sys.stdin)["backups"]))')"
+check "keep: the 2 newest, the newest over a day, the newest over a week" "a b d f" "$(PYTHONPATH=scripts python3 -c '
+import fluxck as c
+names=["20261011-120000-corekeeper.tar.gz","20261011-110000-corekeeper.tar.gz","20261011-100000-corekeeper.tar.gz","20261009-120000-corekeeper.tar.gz","20261008-120000-corekeeper.tar.gz","20261001-120000-corekeeper.tar.gz"]
+now=c.backup_time(names[0])
+k=c.backups_to_keep(names,2,now)
+print(" ".join("abcdef"[i] for i,n in enumerate(names) if n in k))')"
+first="$(ck backups | python3 -c 'import json,sys;print(json.load(sys.stdin)["backups"][-1]["name"])')"
+echo changed >"${data}/DedicatedServer/worlds/0.world.gzip"
+check "a bad backup name is refused" "2" "$(status ck restore '../x.tar.gz')"
+check "restore is pending (no server to restart)" "False" "$(ck restore "${first}" | python3 -c 'import json,sys;print(json.load(sys.stdin)["restarting"])')"
+ck do-restore >"${tmp}/restore"
+check "the restore puts the world back" "w0" "$(cat "${data}/DedicatedServer/worlds/0.world.gzip")"
+check "after a safety backup" "1" "$(grep -c 'before restoring' "${tmp}/restore")"
+check "and it is no longer pending" "1" "$(status test -e "${data}/flux/restore-pending.json")"
+
+# Failed updates: a target that did not install is skipped for 6 hours.
+mkdir -p "${tmp}/server/steamapps" && printf '"AppState"\n{\n\t"buildid"\t\t"100"\n}\n' >"${tmp}/server/steamapps/appmanifest_1963720.acf"
+ck update-target 200
+ck update-check >/dev/null
+check "a build that did not install is skipped" "0" "$(status ck update-skip 200)"
+check "another build is not" "1" "$(status ck update-skip 300)"
+ck update-target 100
+ck update-check >/dev/null
+check "a reached target clears the failure" "1" "$(status ck update-skip 200)"
+
+# The panel's restart is a marker the supervisor acts on, one at a time.
+check "no server, no restart" "3" "$(status ck restart)"
+check "the marker has a not-before" "notbefore=0" "$(PYTHONPATH=scripts FLUX_RESTART_MARKER="${tmp}/m2" python3 -c 'import fluxck as c; c.request_restart("requested: test")'; sed -n 2p "${tmp}/m2")"
+check "a second request joins the first" "False" "$(PYTHONPATH=scripts FLUX_RESTART_MARKER="${tmp}/m2" python3 -c 'import fluxck as c; print(c.request_restart("requested: again"))')"
+check "the supervisor reads it" "123" "$(printf 'x\nnotbefore=123\n' >"${tmp}/m3"; flux_marker_not_before "${tmp}/m3")"
+
+# Notes and the start counter.
+ck state starting
+check "a start counts" "1" "$(ck status | python3 -c 'import json,sys;print(json.load(sys.stdin)["generation"])')"
+ck note nextRestart 1791800000
+check "the next daily restart" "1791800000" "$(ck status | python3 -c 'import json,sys;print(json.load(sys.stdin)["nextRestart"])')"
+ck note nextRestart
+check "removed" "None" "$(ck status | python3 -c 'import json,sys;print(json.load(sys.stdin)["nextRestart"])')"
+
+# Mods: a zip bomb and downloads from elsewhere are refused.
+python3 -c 'import zipfile,sys; z=zipfile.ZipFile(sys.argv[1],"w",zipfile.ZIP_DEFLATED); z.writestr("Big/ModManifest.json","{}"); z.writestr("Big/blob.bin", bytes(2*1024*1024))' "${tmp}/big.zip"
+check "an archive over the limit is refused" "2" "$(status ck FLUX_MOD_MAX_BYTES=1048576 mod-install "${tmp}/big.zip")"
+check "a download from elsewhere is refused" "2" "$(status ck mod-install-url 'https://example.com/mod.zip')"
+check "plain http is refused" "2" "$(status ck mod-install-url 'http://g-5289.modapi.io/x.zip')"
 
 printf '\n%d passed, %d failed\n' "${pass}" "${fail}"
 [ "${fail}" = "0" ]

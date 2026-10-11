@@ -49,7 +49,12 @@ A change to what the image does bumps `VERSION` and gets a line under "Versions"
 - **With direct connections an empty password becomes a new random one on every start.** `apply`
   chooses one once and keeps it in the panel's settings.
 - **No console.** stdin is ignored and there is no RCON: admin actions are in game. The roster is
-  read from the game's log (`flux/current.log`, passed with `-logfile`).
+  read from the game's log (`<install>/flux-logs/current.log`, passed with `-logfile`; local, never
+  synced, capped), incrementally (`/tmp/flux-roster.json` keeps the offset).
+- **The panel's restart is a marker** (`flux-ck restart` returns at once): `wait_for_generation`
+  sends the SIGTERM when `notbefore=` in the marker allows. Nothing else signals the server for a
+  restart.
+- **Empty env = unset**: the marketplace writes blank declared parameters as `NAME=`.
 - **The game loads EVERY folder in Mods/**, a renamed `X.disabled` too: a mod that is off is moved
   to `Mods.disabled/`, outside it. Archives are unpacked in `flux/tmp` and renamed into place.
 - **A quit seconds after a new world starts saves nothing.** `flux-ck restart` waits 15 s after the

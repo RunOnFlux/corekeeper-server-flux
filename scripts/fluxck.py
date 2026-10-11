@@ -19,25 +19,45 @@
     flux-ck mod-install <zip>        unpack a mod archive into Mods/
     flux-ck mod-enable <dir> on|off  switch a mod on or off (off = moved to Mods.disabled/, kept)
     flux-ck mod-remove <dir>         delete a mod
+    flux-ck mod-install-url <url>    download a mod archive from mod.io's CDN and install it
     flux-ck restart                  save, stop and start the server again (applies the above)
+    flux-ck backups                  the backups in flux/backups (name, size, date, why)
+    flux-ck restore <backup>         restore one: on the next start (the server is restarted now),
+                                     after a safety backup of what is there
     flux-ck new-game-id              a valid random Game ID (28 characters)
+
+    fluxck.py backup <why> [force]   make a backup (the supervisor): skipped when the newest is
+                                     younger than FLUX_BACKUP_MIN_AGE_MINUTES unless forced; prunes
+    fluxck.py do-restore             apply a pending restore (the supervisor, before a start)
+    fluxck.py note <key> [value]     a field of flux/state.json the supervisor keeps (nextRestart,
+                                     updateWaiting); no value removes it
+    fluxck.py update-target <build>  remember the build a planned update restart is for
+    fluxck.py update-check           after the update step: a target that was not reached is
+                                     remembered as failed (the watcher skips it for 6 hours)
+    fluxck.py update-skip <build>    exit 0 when that build failed less than 6 hours ago
 
 Settings changed by the panel, admins and bans are applied on the NEXT start: the server owns
 its files while it runs and rewrites them as it stops (measured: Admins.json and
 ServerConfig.json are written back on quit), so an edit made under it would be undone.
 
-Precedence: an environment variable that is SET (even to "") is applied on every start; one that
-is not set leaves the panel's value, and then the file's. Except a NEW world's mode and seed,
-where the panel's choice wins and the environment is the default (see for_new_world).
+Precedence: an environment variable that is SET to a value is applied on every start; one that is
+not set, or set EMPTY (the marketplace writes every declared parameter, blank ones included),
+leaves the panel's value, and then the file's. Except a NEW world's mode and seed, where the
+panel's choice wins and the environment is the default (see for_new_world).
 """
 
 import json
 import os
 import re
 import shutil
+import signal
+import subprocess
 import sys
+import tarfile
 import tempfile
 import time
+import urllib.parse
+import urllib.request
 import zipfile
 
 SERVER_DIR = os.environ.get("FLUX_SERVER_DIR", "/mnt/corekeeper/server")
@@ -49,7 +69,24 @@ STATE_FILE = os.path.join(STATE_DIR, "state.json")
 SETTINGS_FILE = os.path.join(STATE_DIR, "settings.json")
 ADMIN_EDITS_FILE = os.path.join(STATE_DIR, "admins-pending.json")
 SEEN_FILE = os.path.join(STATE_DIR, "players-seen.json")
-GAME_LOG = os.path.join(STATE_DIR, "current.log")
+# The game's log is on the INSTALL volume (local to the node, never synced): Core Keeper writes
+# leak warnings into it for as long as it runs, and on the synced data volume that was steady
+# Syncthing traffic and a log that could fill the plan's disk.
+GAME_LOG = os.environ.get("FLUX_GAME_LOG", os.path.join(SERVER_DIR, "flux-logs", "current.log"))
+# Where the status command keeps its place in the log, so a poll reads only what is new.
+ROSTER_CACHE = os.environ.get("FLUX_ROSTER_CACHE", "/tmp/flux-roster.json")
+BACKUP_DIR = os.environ.get("FLUX_BACKUP_DIR", os.path.join(STATE_DIR, "backups"))
+BACKUP_INDEX = os.path.join(BACKUP_DIR, "index.json")
+RESTORE_FILE = os.path.join(STATE_DIR, "restore-pending.json")
+UPDATE_TARGET_FILE = os.path.join(STATE_DIR, "update-target.json")
+UPDATE_FAILED_FILE = os.path.join(STATE_DIR, "update-failed.json")
+UPDATE_FAILED_SKIP = 6 * 3600
+RESTART_MARKER = os.environ.get("FLUX_RESTART_MARKER", "/tmp/flux-restart-requested")
+BACKUP_NAME_RE = re.compile(r"^\d{8}-\d{6}-corekeeper\.tar\.gz$")
+# A mod archive bigger than this, once unpacked, is refused (a zip bomb fills the plan's disk).
+MOD_MAX_BYTES = int(os.environ.get("FLUX_MOD_MAX_BYTES", str(512 * 1024 * 1024)))
+# mod.io's file CDN: where `mod-install-url` may download from, nowhere else.
+MODIO_HOSTS = re.compile(r"^([a-z0-9-]+\.)*(mod\.io|modapi\.io|modcdn\.io)$")
 # Mods that are off: OUTSIDE Mods/, which the game loads whole (see the Mods section below).
 DISABLED_DIR = os.environ.get("FLUX_MODS_DISABLED_DIR", os.path.join(DATA_DIR, "Mods.disabled"))
 # How image 1.0.0 switched a mod off, inside Mods/; moved out by migrate_disabled.
@@ -82,7 +119,7 @@ CONFIG_DEFAULTS = {
 
 # Game ID (ARGUMENTS.txt): 15 to 28 alphanumerics, none of Y, y, x, 0 or O. The server replaces
 # an invalid one with a random one, which would silently change how everybody joins.
-GAME_ID_RE = re.compile(r"^[A-NP-Za-wz1-9]{15,28}$")
+GAME_ID_RE = re.compile(r"^[A-NP-XZa-wz1-9]{15,28}$")
 GAME_ID_ALPHABET = "ABCDEFGHIJKLMNPQRSTUVWXZabcdefghijklmnopqrstuvwz123456789"
 PASSWORD_MAX = 28
 
@@ -130,7 +167,9 @@ def fail(message, code=1):
 # ------------------------------------------------------------------------------------------------
 
 def env_set(name):
-    return name in os.environ
+    """A variable counts only with a value: the marketplace writes every declared parameter, the
+    ones left blank as NAME=, and a blank one must not wipe what the panel set."""
+    return str(os.environ.get(name, "")).strip() != ""
 
 
 def truthy(value):
@@ -141,6 +180,19 @@ def clean_text(value, limit):
     """One line of printable text: it ends up on the server's command line and in a JSON file."""
     value = re.sub(r"[\x00-\x1f\x7f]", " ", str(value)).strip()
     return value[:limit]
+
+
+def clean_password(value):
+    """A join password: one line, and no ';', which splits the game's IP;PORT;;PASSWORD join line."""
+    return clean_text(str(value).replace(";", ""), PASSWORD_MAX)
+
+
+def direct_connections():
+    """Whether CK_PORT gives direct connections (the entrypoint's flux_game_port: unset is 27015,
+    'relay', 'off', 'none', '0' or empty are the Steam relay only)."""
+    if "CK_PORT" not in os.environ:
+        return True
+    return str(os.environ["CK_PORT"]).strip().lower() not in ("", "relay", "off", "none", "0")
 
 
 def valid_game_id(value):
@@ -222,7 +274,7 @@ def apply_config(config, settings, notes):
 
     value, source = effective(settings, "CK_PASSWORD", "password")
     if value is not None:
-        password = clean_text(value, PASSWORD_MAX)
+        password = clean_password(value)
         config["password"] = password
         notes.append(f"password = {'(set)' if password else '(empty: the server makes a random one)'} ({source})")
 
@@ -302,11 +354,70 @@ def command_args(config, settings, notes):
             args += ["-allowonlyplatform", platform]
             notes.append(f"allowonlyplatform = {platform} ({source})")
 
-    value, source = effective(settings, "CK_ACTIVATE_ALL_CONTENT", "activateAllContent")
-    if value is not None and truthy(value):
+    # The content bundles: from the panel, ONCE, for the world the server is about to load (the
+    # bundles become that world's for good); the setting is then cleared, so a world switched to
+    # or uploaded later is not changed too. CK_ACTIVATE_ALL_CONTENT, an owner's choice in the
+    # deploy, applies to every world on every start, as documented.
+    if env_set("CK_ACTIVATE_ALL_CONTENT"):
+        if truthy(os.environ["CK_ACTIVATE_ALL_CONTENT"]):
+            args.append("-activateallcontent")
+            notes.append("activateallcontent (env, every world)")
+    elif truthy(settings.get("activateAllContent")):
         args.append("-activateallcontent")
-        notes.append(f"activateallcontent ({source})")
+        settings.pop("activateAllContent", None)
+        done = settings.setdefault("contentActivated", [])
+        if config.get("world", 0) not in done:
+            done.append(config.get("world", 0))
+        write_json(SETTINGS_FILE, settings)
+        notes.append(f"activateallcontent (panel, once, world {config.get('world', 0)})")
     return args
+
+
+def entry_key(entry):
+    """How the panel names one Admins.json / PlayerBans.json entry: "<SteamID64>" for a Steam
+    player, "cp:<crossPlatformId>" for one who joined from Epic, Microsoft Store or GOG (their
+    steamId is 0), None for an entry neither identifies (kept as it is, never touched)."""
+    if not isinstance(entry, dict):
+        return None
+    sid = steam_id(entry.get("steamId"))
+    if sid:
+        return str(sid)
+    cp = player_id(entry.get("crossPlatformId"))
+    if cp:
+        return f"cp:{cp}"
+    return None
+
+
+def key_ok(key):
+    """A key the panel may send: a SteamID64, or cp:<digits> for a non-Steam player."""
+    key = str(key).strip()
+    return bool(steam_id(key)) or bool(re.fullmatch(r"cp:\d{1,20}", key))
+
+
+def new_entry(key, existing, privileges=None):
+    """An admin or ban entry as the server writes one (measured, 1.3.0.6: it keeps an entry with
+    name, steamId and crossPlatformId and adds `index` itself). Only a Steam player can be added by
+    id: a cross-platform id alone is the game's to assign."""
+    seen = read_json(SEEN_FILE, {}) or {}
+    name = (seen.get(key) or {}).get("name", "")
+    index = max([e.get("index", 0) for e in existing if isinstance(e, dict)] + [0]) + 1
+    entry = {"index": index, "name": name, "steamId": int(key), "crossPlatformId": 0}
+    if privileges is not None:
+        entry["privileges"] = privileges
+    return entry
+
+
+def apply_list(entries, wanted, privileges, label, notes):
+    """The panel's list for admins or bans: entries whose key is in `wanted` are kept, Steam ids
+    not there yet are added, entries the panel cannot name are kept as they are."""
+    kept = [e for e in entries if entry_key(e) is None or entry_key(e) in wanted]
+    have = {entry_key(e) for e in kept}
+    for key in wanted:
+        if key not in have and steam_id(key):
+            kept.append(new_entry(key, kept, privileges))
+    removed = len([e for e in entries if entry_key(e) is not None and entry_key(e) not in wanted])
+    notes.append(f"{label} from the panel: {len(kept)} ({removed} removed)")
+    return kept
 
 
 def apply_admins(notes):
@@ -314,40 +425,37 @@ def apply_admins(notes):
     applied. Admins added in game are kept: the variable adds, it never removes."""
     path = os.path.join(GAME_DATA, "Admins.json")
     data = read_json(path, {}) or {}
-    admins = data.get("adminList") if isinstance(data.get("adminList"), list) else []
+    if not isinstance(data, dict):
+        notes.append("WARN Admins.json was not an object; left as it is")
+        data = None
+    admins = data.get("adminList") if data and isinstance(data.get("adminList"), list) else []
     bans_path = os.path.join(GAME_DATA, "PlayerBans.json")
     bans_data = read_json(bans_path, {}) or {}
-    bans = bans_data.get("banList") if isinstance(bans_data.get("banList"), list) else []
+    if not isinstance(bans_data, dict):
+        notes.append("WARN PlayerBans.json was not an object; left as it is")
+        bans_data = None
+    bans = bans_data.get("banList") if bans_data and isinstance(bans_data.get("banList"), list) else []
 
     edits = read_json(ADMIN_EDITS_FILE)
-    wanted = None
-    if isinstance(edits, dict) and isinstance(edits.get("admins"), list):
-        wanted = [i for i in (steam_id(x) for x in edits["admins"]) if i]
+    edits = edits if isinstance(edits, dict) else None
+    if edits and isinstance(edits.get("admins"), list):
+        wanted = [str(k) for k in edits["admins"] if key_ok(k)]
+        admins = apply_list(admins, wanted, 2, "admins", notes)
     for raw in (os.environ.get("CK_ADMINS") or "").replace(";", ",").split(","):
         sid = steam_id(raw)
-        if sid and wanted is not None and sid not in wanted:
-            wanted.append(sid)
-        if sid and wanted is None and not any(a.get("steamId") == sid for a in admins if isinstance(a, dict)):
-            admins.append(admin_entry(sid, admins))
+        if sid and str(sid) not in {entry_key(a) for a in admins}:
+            admins.append(new_entry(str(sid), admins, 2))
             notes.append(f"admin added: {sid} (CK_ADMINS)")
-    if wanted is not None:
-        kept = [a for a in admins if isinstance(a, dict) and a.get("steamId") in wanted]
-        for sid in wanted:
-            if not any(a.get("steamId") == sid for a in kept):
-                kept.append(admin_entry(sid, kept))
-        removed = len(admins) - len([a for a in admins if isinstance(a, dict) and a.get("steamId") in wanted])
-        admins = kept
-        notes.append(f"admins from the panel: {len(admins)} ({removed} removed)")
-    if isinstance(edits, dict) and isinstance(edits.get("bans"), list):
-        keep = {i for i in (player_id(x) for x in edits["bans"]) if i is not None}
-        before = len(bans)
-        bans = [b for b in bans if ban_id(b) in keep]
-        notes.append(f"bans from the panel: {len(bans)} ({before - len(bans)} lifted)")
+    if edits and isinstance(edits.get("bans"), list):
+        wanted = [str(k) for k in edits["bans"] if key_ok(k)]
+        bans = apply_list(bans, wanted, None, "bans", notes)
 
-    data["adminList"] = admins
-    write_json(path, data)
-    bans_data["banList"] = bans
-    write_json(bans_path, bans_data)
+    if data is not None:
+        data["adminList"] = admins
+        write_json(path, data)
+    if bans_data is not None:
+        bans_data["banList"] = bans
+        write_json(bans_path, bans_data)
     if edits is not None:
         try:
             os.remove(ADMIN_EDITS_FILE)
@@ -355,24 +463,12 @@ def apply_admins(notes):
             pass
 
 
-def admin_entry(sid, existing):
-    """An admin as the server writes one (privileges 2 = the owner's level)."""
-    seen = read_json(SEEN_FILE, {}) or {}
-    name = (seen.get(str(sid)) or {}).get("name", "")
-    index = max([a.get("index", 0) for a in existing if isinstance(a, dict)] + [0]) + 1
-    return {"index": index, "privileges": 2, "name": name, "steamId": sid}
-
-
 def ban_id(entry):
-    """The player id of one PlayerBans.json entry, whatever the server named the field."""
+    """The panel's key for one PlayerBans.json entry (see entry_key); a bare id for anything else."""
     if isinstance(entry, dict):
-        for key in ("steamId", "userId", "id", "playerId"):
-            if key in entry:
-                return player_id(entry[key])
-        for value in entry.values():
-            if isinstance(value, int):
-                return value
-    return player_id(entry)
+        return entry_key(entry)
+    pid = player_id(entry)
+    return None if pid is None else str(pid)
 
 
 def cmd_apply():
@@ -411,11 +507,31 @@ def cmd_apply():
 # ------------------------------------------------------------------------------------------------
 
 def cmd_state(state, message=None):
+    """`generation` counts the server's starts: the panel waits for it to change after asking for
+    a restart, rather than comparing its own clock with this machine's."""
     data = read_json(STATE_FILE, {}) or {}
     if data.get("state") != state:
         data["since"] = int(time.time())
+    if state == "starting":
+        data["generation"] = int(data.get("generation") or 0) + 1
     data.update({"state": state, "message": message or None,
                  "image": os.environ.get("FLUX_IMAGE_VERSION", "dev")})
+    write_json(STATE_FILE, data, indent=None)
+
+
+NOTE_KEYS = ("nextRestart", "updateWaiting")
+
+
+def cmd_note(key, value=None):
+    """A field of state.json the supervisor keeps for the panel's Overview: nextRestart (epoch of
+    the next daily restart), updateWaiting (the build a game update waits on an empty server for)."""
+    if key not in NOTE_KEYS:
+        fail(f"unknown note {key}", 64)
+    data = read_json(STATE_FILE, {}) or {}
+    if value in (None, ""):
+        data.pop(key, None)
+    else:
+        data[key] = int(value) if str(value).isdigit() and key == "nextRestart" else value
     write_json(STATE_FILE, data, indent=None)
 
 
@@ -425,6 +541,48 @@ def read_log(path=GAME_LOG):
             return f.read().splitlines()
     except OSError:
         return []
+
+
+def roster_incremental(path=GAME_LOG, cache_path=ROSTER_CACHE):
+    """roster(), reading only what the log gained since the last call: a poll runs `status`
+    several times, and the log grows for as long as the server runs. The cache is per file (inode)
+    and starts over when the file is new, shorter (rotated or truncated) or the cache is unreadable."""
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None, [], None
+    cache = read_json(cache_path, {}) or {}
+    if cache.get("inode") != st.st_ino or cache.get("offset", 0) > st.st_size or cache.get("path") != path:
+        cache = {"inode": st.st_ino, "path": path, "offset": 0, "session": None, "online": {}, "version": None}
+    with open(path, "rb") as f:
+        f.seek(cache["offset"])
+        chunk = f.read()
+    # Only whole lines: a line the server is still writing is read next time.
+    end = chunk.rfind(b"\n") + 1
+    lines = chunk[:end].decode("utf-8", "replace").replace("\x00", "").splitlines()
+    session, online, version = cache.get("session"), dict(cache.get("online") or {}), cache.get("version")
+    for line in lines:
+        m = SESSION_RE.search(line)
+        if m:
+            session, online = m.group(1), {}
+            continue
+        if version is None and "ersion" in line:
+            v = VERSION_RE.search(line)
+            if v:
+                version = v.group(1)
+        m = JOIN_RE.search(line)
+        if m and (m.group(3) or "False").lower() != "true":
+            online[m.group(1)] = {"id": m.group(1), "name": m.group(2).strip()}
+            continue
+        m = LEAVE_RE.search(line)
+        if m:
+            online.pop(m.group(1), None)
+    cache.update({"offset": cache["offset"] + end, "session": session, "online": online, "version": version})
+    try:
+        write_json(cache_path, cache, indent=None)
+    except OSError:
+        pass
+    return session, list(online.values()), version
 
 
 def roster(lines):
@@ -492,13 +650,18 @@ def installed_build():
 def cmd_status():
     state = read_json(STATE_FILE, {}) or {}
     config = read_json(os.path.join(GAME_DATA, "ServerConfig.json"), {}) or {}
-    session, players, version = roster(read_log())
+    session, players, version = roster_incremental()
     remember_players(players)
     info = session_info(session)
     out({
         "state": state.get("state", "stopped"),
         "message": state.get("message"),
         "since": state.get("since"),
+        "generation": state.get("generation", 0),
+        "nextRestart": state.get("nextRestart"),
+        "updateWaiting": state.get("updateWaiting"),
+        "restartPending": os.path.exists(RESTART_MARKER),
+        "restorePending": (read_json(RESTORE_FILE, {}) or {}).get("backup"),
         "image": state.get("image"),
         "build": installed_build(),
         "version": version,
@@ -507,7 +670,9 @@ def cmd_status():
         "players": players,
         "max_players": config.get("maxNumberPlayers"),
         "gameId": info.get("gameId") or config.get("gameId") or None,
-        "direct": "port" in info,
+        # From CK_PORT, not from the session line: the log has none while the server updates,
+        # starts or is stopped, and the panel must not say "Steam only" then.
+        "direct": direct_connections(),
         "pending": changes_pending(state),
     })
 
@@ -524,11 +689,11 @@ def changes_pending(state):
 
 def cmd_connect():
     config = read_json(os.path.join(GAME_DATA, "ServerConfig.json"), {}) or {}
-    session, _, _ = roster(read_log())
+    session, _, _ = roster_incremental()
     info = session_info(session)
     out({
         "gameId": info.get("gameId") or config.get("gameId") or None,
-        "direct": "port" in info,
+        "direct": direct_connections(),
         "port": int(info["port"]) if info.get("port", "").isdigit() else None,
         "password": info.get("password", config.get("password") or None),
     })
@@ -585,7 +750,10 @@ def cmd_set_settings(raw):
                 errors.append("gameId must be 15-28 letters and digits, without Y, y, x, 0 and O")
                 continue
         elif key == "password":
-            value = clean_text(value, PASSWORD_MAX)
+            if ";" in str(value):
+                errors.append("password cannot contain ';' (it splits the game's join line)")
+                continue
+            value = clean_password(value)
         elif key in ("worldName", "seed"):
             value = clean_text(value, 64)
         elif key == "worldMode":
@@ -646,41 +814,54 @@ def cmd_worlds():
 # Admins and bans
 # ------------------------------------------------------------------------------------------------
 
+def big_ints_as_str(entry):
+    """IDs AS STRINGS: a SteamID64 is above 2^53, and a browser's JSON.parse rounds it to another
+    player's number (76561198000000001 reads back as ...000000000)."""
+    if not isinstance(entry, dict):
+        return str(entry)
+    return {k: (str(v) if isinstance(v, int) and abs(v) > 2 ** 53 else v) for k, v in entry.items()}
+
+
 def cmd_admins():
     admins = (read_json(os.path.join(GAME_DATA, "Admins.json"), {}) or {}).get("adminList") or []
     bans = (read_json(os.path.join(GAME_DATA, "PlayerBans.json"), {}) or {}).get("banList") or []
     seen = read_json(SEEN_FILE, {}) or {}
-    # IDs AS STRINGS: a SteamID64 is above 2^53, and a browser's JSON.parse rounds it to another
-    # player's number (76561198000000001 reads back as ...000000000).
+
+    def row(entry):
+        key = entry_key(entry)
+        return {**big_ints_as_str(entry), "key": key,
+                "kind": "steam" if key and not key.startswith("cp:") else ("crossplatform" if key else "unknown"),
+                "seenName": (seen.get(key or "") or {}).get("name")}
+
     out({
-        "admins": [{**a, "steamId": str(a.get("steamId"))} if isinstance(a, dict) else a for a in admins],
-        "bans": [{"id": None if ban_id(b) is None else str(ban_id(b)), "name": (seen.get(str(ban_id(b))) or {}).get("name"),
-                  "raw": {k: (str(v) if isinstance(v, int) and v > 2 ** 53 else v) for k, v in b.items()} if isinstance(b, dict) else str(b)}
-                 for b in bans],
+        "admins": [row(a) for a in admins if isinstance(a, dict)],
+        "bans": [{"id": ban_id(b), "name": (b.get("name") if isinstance(b, dict) else None) or (seen.get(str(ban_id(b))) or {}).get("name"),
+                  "kind": row(b)["kind"] if isinstance(b, dict) else "unknown", "raw": big_ints_as_str(b)} for b in bans],
         "seen": [{"id": k, **v} for k, v in sorted(seen.items(), key=lambda kv: -kv[1].get("lastSeen", 0))],
         "pending": read_json(ADMIN_EDITS_FILE),
     })
 
 
 def cmd_set_admins(raw):
+    """{"admins": [<key>...], "bans": [<key>...]}: the WHOLE lists as the panel wants them, keys
+    from `flux-ck admins` (a SteamID64, or cp:<id> for a non-Steam player). A Steam id not in a list
+    yet is added (so a ban by SteamID64 is a ban); entries without a key are never touched."""
     try:
         edits = json.loads(raw)
     except ValueError:
         fail("not JSON")
     if not isinstance(edits, dict):
         fail("expected a JSON object")
-    clean = {}
-    if "admins" in edits:
-        if not isinstance(edits["admins"], list):
-            fail("admins must be a list of SteamID64s")
-        bad = [x for x in edits["admins"] if steam_id(x) is None]
+    clean = read_json(ADMIN_EDITS_FILE, {}) or {}
+    for name in ("admins", "bans"):
+        if name not in edits:
+            continue
+        if not isinstance(edits[name], list):
+            fail(f"{name} must be a list", 2)
+        bad = [str(x) for x in edits[name] if not key_ok(x)]
         if bad:
-            fail(f"not a SteamID64 (17 digits starting 7656119): {', '.join(map(str, bad))}", 2)
-        clean["admins"] = [str(steam_id(x)) for x in edits["admins"]]
-    if "bans" in edits:
-        if not isinstance(edits["bans"], list) or any(player_id(x) is None for x in edits["bans"]):
-            fail("bans must be a list of player ids", 2)
-        clean["bans"] = [str(player_id(x)) for x in edits["bans"]]
+            fail(f"not a SteamID64 (17 digits starting 7656119) or cp:<id>: {', '.join(bad)}", 2)
+        clean[name] = list(dict.fromkeys(str(steam_id(x)) if steam_id(x) else str(x).strip() for x in edits[name]))
     write_json(ADMIN_EDITS_FILE, clean)
     out({"ok": True, "pending": clean, "appliesOn": "restart"})
 
@@ -774,6 +955,9 @@ def cmd_mod_install(archive):
         for n in names:
             if n.startswith("/") or ".." in n.replace("\\", "/").split("/"):
                 fail(f"refused: {n} leaves the mod folder", 2)
+        unpacked = sum(i.file_size for i in z.infolist())
+        if unpacked > MOD_MAX_BYTES:
+            fail(f"refused: the archive unpacks to {unpacked // (1024 * 1024)} MB, over the {MOD_MAX_BYTES // (1024 * 1024)} MB limit", 2)
         manifests = [n for n in names if os.path.basename(n).lower() == "modmanifest.json"]
         if not manifests:
             fail("no ModManifest.json in the archive: this is not a Core Keeper mod", 2)
@@ -808,6 +992,41 @@ def cmd_mod_install(archive):
          "appliesOn": "restart"})
 
 
+def cmd_mod_install_url(url):
+    """A mod archive from mod.io's CDN (the hub's mod.io catalogue gives the URL), downloaded and
+    installed like an uploaded one. Only https on mod.io's own hosts: the panel's argument never
+    makes the server fetch anything else."""
+    parsed = urllib.parse.urlparse(str(url))
+    if parsed.scheme != "https" or not MODIO_HOSTS.match(parsed.hostname or ""):
+        fail("only https downloads from mod.io", 2)
+    tmp_root = os.path.join(STATE_DIR, "tmp")
+    os.makedirs(tmp_root, exist_ok=True)
+    fd, archive = tempfile.mkstemp(dir=tmp_root, prefix="modio-", suffix=".zip")
+    try:
+        req = urllib.request.Request(str(url), headers={"User-Agent": "runonflux/corekeeper-server-flux"})
+        with urllib.request.urlopen(req, timeout=120) as r, os.fdopen(fd, "wb") as f:
+            host = urllib.parse.urlparse(r.geturl()).hostname or ""
+            if not MODIO_HOSTS.match(host):
+                fail("the download was redirected away from mod.io", 2)
+            got = 0
+            while True:
+                chunk = r.read(1 << 20)
+                if not chunk:
+                    break
+                got += len(chunk)
+                if got > MOD_MAX_BYTES:
+                    fail("refused: the download is over the size limit", 2)
+                f.write(chunk)
+        cmd_mod_install(archive)
+    except OSError as e:
+        fail(f"the download failed: {e}", 1)
+    finally:
+        try:
+            os.remove(archive)
+        except OSError:
+            pass
+
+
 def cmd_mod_enable(name, on):
     migrate_disabled()
     name = safe_dir(name).removesuffix(DISABLED_SUFFIX)
@@ -837,27 +1056,218 @@ def cmd_mod_remove(name):
     out({"ok": True, "dir": name, "appliesOn": "restart"})
 
 
+def game_pids():
+    return subprocess.run(["pgrep", "-f", r"^\./CoreKeeperServer "], capture_output=True, text=True).stdout.split()
+
+
+def request_restart(reason):
+    """Asks the supervisor for a restart and returns at once: it writes the marker the supervisor
+    reads, with the earliest time it may stop the server (a world the server made seconds ago is
+    not saved by a quit yet: a SIGTERM 2 s after the session started wrote no world file, 10 s
+    after it did), and the supervisor sends the SIGTERM. One restart at a time: a request while one
+    is pending joins it."""
+    if os.path.exists(RESTART_MARKER):
+        return False
+    state = read_json(STATE_FILE, {}) or {}
+    not_before = 0
+    if state.get("state") == "running" and state.get("since"):
+        not_before = int(state["since"]) + SETTLE_SECONDS
+    tmp = RESTART_MARKER + ".tmp"
+    with open(tmp, "w") as f:
+        f.write(f"{reason}\nnotbefore={not_before}\n")
+    os.replace(tmp, RESTART_MARKER)
+    return True
+
+
 def cmd_restart():
     """Restarts the server in place (the supervisor starts the next one): how the panel applies
-    saved settings without a redeploy. SIGTERM saves first."""
-    import signal
-    import subprocess
-    pids = subprocess.run(["pgrep", "-f", r"^\./CoreKeeperServer "], capture_output=True, text=True).stdout.split()
-    if not pids:
+    saved settings without a redeploy. Returns at once; the panel waits for `generation` to move."""
+    if not game_pids():
         fail("the server is not running", 3)
-    # A world the server made seconds ago is not saved by a quit yet (measured: a SIGTERM 2 s after
-    # the session started wrote no world file; 10 s after, it did). So a restart that close to a
-    # start waits for the world to settle first.
     state = read_json(STATE_FILE, {}) or {}
-    if state.get("state") == "running" and state.get("since"):
-        wait = int(state["since"]) + SETTLE_SECONDS - time.time()
-        if 0 < wait <= SETTLE_SECONDS:
-            time.sleep(wait)
-    with open(os.environ.get("FLUX_RESTART_MARKER", "/tmp/flux-restart-requested"), "w") as f:
-        f.write("requested: from the panel\n")
-    for pid in pids:
-        os.kill(int(pid), signal.SIGTERM)
-    out({"ok": True})
+    started = request_restart("requested: from the panel")
+    out({"ok": True, "alreadyPending": not started, "generation": state.get("generation", 0)})
+
+
+# ------------------------------------------------------------------------------------------------
+# Backups: flux/backups/<UTC>-corekeeper.tar.gz, made by the supervisor (on start and every few
+# hours) and before a restore. index.json says why each was made.
+#
+# Kept: the FLUX_BACKUP_KEEP newest, AND the newest one older than a day and the newest one older
+# than a week, so a server that crash-loops (each start a backup) can never rotate every good copy
+# away. A start backup is skipped when the newest is younger than FLUX_BACKUP_MIN_AGE_MINUTES.
+# ------------------------------------------------------------------------------------------------
+
+def backup_files():
+    try:
+        names = [n for n in os.listdir(BACKUP_DIR) if BACKUP_NAME_RE.match(n)]
+    except OSError:
+        return []
+    return sorted(names, reverse=True)
+
+
+def backup_time(name):
+    """The UTC time in a backup's name, as an epoch."""
+    import calendar
+    try:
+        return calendar.timegm(time.strptime(name[:15], "%Y%m%d-%H%M%S"))
+    except ValueError:
+        return 0
+
+
+def backups_to_keep(names, keep, now):
+    """Names newest first. The `keep` newest, the newest older than 1 day, the newest older than 7."""
+    kept = set(names[:max(keep, 0)])
+    for age in (86400, 7 * 86400):
+        older = [n for n in names if now - backup_time(n) >= age]
+        if older:
+            kept.add(older[0])
+    return kept
+
+
+def cmd_backup(why, force=None):
+    if not os.path.isdir(os.path.join(GAME_DATA, "worlds")) or not any(
+            f.endswith(".world.gzip") for f in os.listdir(os.path.join(GAME_DATA, "worlds"))):
+        print("# backup skipped: no world yet")
+        return
+    names = backup_files()
+    now = int(time.time())
+    min_age = int(os.environ.get("FLUX_BACKUP_MIN_AGE_MINUTES", "60")) * 60
+    if force != "force" and names and now - backup_time(names[0]) < min_age:
+        print(f"# backup ({why}) skipped: the newest is {(now - backup_time(names[0])) // 60} min old")
+        return
+    os.makedirs(BACKUP_DIR, exist_ok=True)
+    name = time.strftime("%Y%m%d-%H%M%S", time.gmtime(now)) + "-corekeeper.tar.gz"
+    if name in names:
+        print(f"# backup ({why}) skipped: one was made this second")
+        return
+    out_path = os.path.join(BACKUP_DIR, name)
+    try:
+        # Python's tarfile, not tar: GNU tar exits 1 for "file changed as we read it", which is
+        # not a broken archive. The worlds are written by the server only on a save.
+        with tarfile.open(out_path + ".part", "w:gz") as t:
+            t.add(GAME_DATA, arcname=os.path.basename(GAME_DATA))
+        os.replace(out_path + ".part", out_path)
+    except (OSError, tarfile.TarError) as e:
+        try:
+            os.remove(out_path + ".part")
+        except OSError:
+            pass
+        print(f"# WARN backup ({why}) failed: {e}")
+        return
+    index = read_json(BACKUP_INDEX, {}) or {}
+    index[name] = why
+    keep = int(os.environ.get("FLUX_BACKUP_KEEP", "10"))
+    names = backup_files()
+    kept = backups_to_keep(names, keep, now)
+    for old in names:
+        if old not in kept:
+            try:
+                os.remove(os.path.join(BACKUP_DIR, old))
+            except OSError:
+                pass
+            index.pop(old, None)
+    write_json(BACKUP_INDEX, {k: v for k, v in index.items() if k in kept}, indent=None)
+    print(f"# backup ({why}): flux/backups/{name}, {os.path.getsize(out_path) // 1024} KB")
+
+
+def cmd_backups():
+    index = read_json(BACKUP_INDEX, {}) or {}
+    rows = []
+    for n in backup_files():
+        p = os.path.join(BACKUP_DIR, n)
+        slots = []
+        try:
+            with tarfile.open(p) as t:
+                slots = sorted(int(m.group(1)) for m in (re.search(r"worlds/(\d+)\.world\.gzip$", x) for x in t.getnames()) if m)
+        except (OSError, tarfile.TarError):
+            pass
+        rows.append({"name": n, "size": os.path.getsize(p), "time": backup_time(n), "why": index.get(n), "slots": slots})
+    out({"backups": rows, "path": "flux/backups", "pending": (read_json(RESTORE_FILE, {}) or {}).get("backup")})
+
+
+def cmd_restore(name):
+    """Restores a whole backup (every world, the settings, admins and bans) on the next start,
+    after a safety backup of what is there now. The server is restarted now when it runs."""
+    if not BACKUP_NAME_RE.match(str(name)) or not os.path.isfile(os.path.join(BACKUP_DIR, name)):
+        fail("no such backup", 2)
+    write_json(RESTORE_FILE, {"backup": name, "at": int(time.time())}, indent=None)
+    restarted = bool(game_pids()) and request_restart(f"requested: restore {name}")
+    out({"ok": True, "backup": name, "restarting": restarted, "appliesOn": "restart"})
+
+
+def cmd_do_restore():
+    """The supervisor, before a start: the pending restore, if any. A safety backup first, then
+    the archive into a staging folder beside DedicatedServer/, then swapped in. A broken archive
+    leaves everything as it was."""
+    pending = read_json(RESTORE_FILE)
+    if not isinstance(pending, dict):
+        return
+    try:
+        os.remove(RESTORE_FILE)
+    except OSError:
+        pass
+    name = pending.get("backup", "")
+    src = os.path.join(BACKUP_DIR, name)
+    if not BACKUP_NAME_RE.match(name) or not os.path.isfile(src):
+        print(f"# WARN restore: {name} is not a backup; nothing restored")
+        return
+    cmd_backup("before restoring " + name, "force")
+    parent = os.path.dirname(GAME_DATA)
+    staging = tempfile.mkdtemp(dir=parent, prefix=".flux-restore-")
+    try:
+        with tarfile.open(src) as t:
+            base = os.path.basename(GAME_DATA)
+            members = [m for m in t.getmembers() if m.name == base or m.name.startswith(base + "/")]
+            if not members or any(m.issym() or m.islnk() or ".." in m.name.split("/") for m in members):
+                raise ValueError("not a Core Keeper backup")
+            t.extractall(staging, members=members, filter="data")
+        old = GAME_DATA + ".flux-old"
+        shutil.rmtree(old, ignore_errors=True)
+        if os.path.isdir(GAME_DATA):
+            os.replace(GAME_DATA, old)
+        os.replace(os.path.join(staging, os.path.basename(GAME_DATA)), GAME_DATA)
+        shutil.rmtree(old, ignore_errors=True)
+        print(f"# restored {name}")
+    except (OSError, tarfile.TarError, ValueError) as e:
+        print(f"# WARN restore of {name} failed ({e}); nothing changed")
+    finally:
+        shutil.rmtree(staging, ignore_errors=True)
+
+
+# ------------------------------------------------------------------------------------------------
+# Game updates that did not land: a planned update restart remembers its target; after the update
+# step a target the install did not reach is remembered as failed, and the watcher leaves that
+# build alone for 6 hours instead of restarting the server for it every half hour.
+# ------------------------------------------------------------------------------------------------
+
+def cmd_update_target(build):
+    write_json(UPDATE_TARGET_FILE, {"target": str(build), "at": int(time.time())}, indent=None)
+
+
+def cmd_update_check():
+    target = read_json(UPDATE_TARGET_FILE)
+    if not isinstance(target, dict):
+        return
+    try:
+        os.remove(UPDATE_TARGET_FILE)
+    except OSError:
+        pass
+    have = installed_build()
+    if have and have != target.get("target"):
+        write_json(UPDATE_FAILED_FILE, {"target": target.get("target"), "at": int(time.time()), "installed": have}, indent=None)
+        print(f"# WARN the update to build {target.get('target')} did not install (still {have}): not retried for 6 hours")
+    else:
+        try:
+            os.remove(UPDATE_FAILED_FILE)
+        except OSError:
+            pass
+
+
+def cmd_update_skip(build):
+    failed = read_json(UPDATE_FAILED_FILE, {}) or {}
+    recent = failed.get("target") == str(build) and time.time() - int(failed.get("at") or 0) < UPDATE_FAILED_SKIP
+    sys.exit(0 if recent else 1)
 
 
 def main(argv):
@@ -880,6 +1290,15 @@ def main(argv):
         "mod-enable": (cmd_mod_enable, 2),
         "mod-remove": (cmd_mod_remove, 1),
         "restart": (cmd_restart, 0),
+        "backup": (cmd_backup, (1, 2)),
+        "backups": (cmd_backups, 0),
+        "restore": (cmd_restore, 1),
+        "do-restore": (cmd_do_restore, 0),
+        "note": (cmd_note, (1, 2)),
+        "update-target": (cmd_update_target, 1),
+        "update-check": (cmd_update_check, 0),
+        "update-skip": (cmd_update_skip, 1),
+        "mod-install-url": (cmd_mod_install_url, 1),
         "new-game-id": (lambda: out({"gameId": random_game_id()}), 0),
     }
     if cmd not in commands:

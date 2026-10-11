@@ -81,7 +81,8 @@ export FLUX_RESTART_BACKOFF=1 FLUX_UPDATE_CHECK_MINUTES=0 CK_WORLD_NAME="Image T
 entry=$!
 check "the server comes up" "0" "$(status wait_for 'grep -q "\"running\"" ${data}/flux/state.json 2>/dev/null' 30)"
 check "on the virtual display" "0" "$(status pgrep -x Xvfb)"
-check "with direct connections" "1" "$(grep -c -- '-port 27015' ${data}/flux/current.log)"
+check "with direct connections" "1" "$(grep -c -- '-port 27015' /mnt/corekeeper/server/flux-logs/current.log)"
+check "the game log is on the local volume, not the synced one" "1" "$(status test -e ${data}/flux/current.log)"
 check "the mods folder is linked to the data volume" "${data}/Mods" "$(readlink /mnt/corekeeper/server/CoreKeeperServer_Data/StreamingAssets/Mods)"
 check "status reads the session" "TestGameIdABCDEFG" "$(flux-ck status | python3 -c 'import json,sys;print(json.load(sys.stdin)["gameId"])')"
 check "the config has the name" "Image Test" "$(python3 -c 'import json;print(json.load(open("'"${data}"'/DedicatedServer/ServerConfig.json"))["worldName"])')"
@@ -91,8 +92,17 @@ flux-ck restart >/dev/null
 check "a panel restart saves the world" "0" "$(status wait_for 'test -f ${data}/DedicatedServer/worlds/0.world.gzip' 20)"
 check "and starts again on the new slot" "0" "$(status wait_for 'grep -q "\"running\"" ${data}/flux/state.json && python3 -c "import json,sys;sys.exit(0 if json.load(open(\"${data}/DedicatedServer/ServerConfig.json\"))[\"world\"]==4 else 1)"' 30)"
 check "the restart was not counted as a crash" "0" "$(grep -c 'restarts within' /tmp/entry.log)"
-check "the previous log is kept" "0" "$(status wait_for 'ls ${data}/flux/logs/*-server.log' 5)"
+check "the previous log is kept" "0" "$(status wait_for 'ls /mnt/corekeeper/server/flux-logs/*-server.log' 5)"
 check "a backup was made on the second start" "0" "$(status wait_for 'ls ${data}/flux/backups/*-corekeeper.tar.gz' 5)"
+check "the panel's restart moved the start counter" "2" "$(flux-ck status | python3 -c 'import json,sys;print(json.load(sys.stdin)["generation"])')"
+
+# A restore through the panel's command: the supervisor restarts, restores, starts again.
+wait_for 'grep -q "\"running\"" ${data}/flux/state.json' 20
+echo after >"${data}/DedicatedServer/worlds/0.world.gzip"
+backup="$(flux-ck backups | python3 -c 'import json,sys;print(json.load(sys.stdin)["backups"][0]["name"])')"
+check "restore restarts the running server" "True" "$(flux-ck restore "${backup}" | python3 -c 'import json,sys;print(json.load(sys.stdin)["restarting"])')"
+check "and the third start has the backup's world" "0" "$(status wait_for '[ "$(flux-ck status | python3 -c "import json,sys;print(json.load(sys.stdin)[\"generation\"])")" = 3 ] && ! grep -q after ${data}/DedicatedServer/worlds/0.world.gzip' 30)"
+check "a safety backup was made first" "0" "$(status grep -q 'before restoring' <(flux-ck backups))"
 
 wait_for 'grep -q "\"running\"" ${data}/flux/state.json' 20
 kill -TERM "${entry}"
