@@ -41,7 +41,7 @@ if [ "${GITHUB_EVENT_NAME:-}" != "schedule" ]; then
 fi
 
 # Packages whose security updates are applied the same week.
-URGENT='^(libc6|libc-bin|libssl[0-9a-z.]*|openssl|ca-certificates|curl|libcurl[0-9a-z.-]*|libgnutls[0-9a-z.]*|libnghttp2-[0-9a-z]*|zlib1g|python3(\.[0-9]+)?(-minimal)?|libpython3(\.[0-9]+)?(-minimal|-stdlib)?|libstdc\+\+6|libgcc-s1|wine[a-z0-9-]*|winehq[a-z0-9-]*|dotnet[a-z0-9.-]*|aspnetcore[a-z0-9.-]*)$'
+URGENT='^(libc6|libc-bin|libssl[0-9a-z.]*|openssl|ca-certificates|curl|libcurl[0-9a-z.-]*|libgnutls[0-9a-z.]*|libnghttp2-[0-9a-z]*|zlib1g|python3(\.[0-9]+)?(-minimal)?|libpython3(\.[0-9]+)?(-minimal|-stdlib)?|libstdc\+\+6|libgcc-s1|wine[a-z0-9-]*|winehq[a-z0-9-]*|dotnet[a-z0-9.-]*|aspnetcore[a-z0-9.-]*)(:[a-z0-9]+)?$'
 monthly=false
 [ "$(date -u +%d)" -le 7 ] && monthly=true
 
