@@ -63,8 +63,11 @@ fi
 
 # Updates the published image is missing, as root (the image may run as another user).
 # "Inst <package> [<installed>] (<candidate> <origin> ..." per package.
+# Only Ubuntu's own archive counts: a package pinned on purpose from another one (V Rising's Wine
+# from WineHQ) always has a newer version there, and would ask for a rebuild that changes nothing.
+# The build runs apt-get upgrade, so what a rebuild applies is exactly what is listed here.
 updates="$(docker run --rm --pull always --user 0 --entrypoint sh "${image}:latest" -c \
-  'apt-get update -qq >/dev/null 2>&1 && apt-get -s upgrade 2>/dev/null | grep "^Inst "' || true)"
+  'apt-get update -qq >/dev/null 2>&1 && apt-get -s upgrade 2>/dev/null | grep "^Inst " | grep " Ubuntu:"' || true)"
 security="$(grep -- '-security' <<<"${updates}" | awk '{print $2}' || true)"
 urgent="$(grep -E "${URGENT}" <<<"${security}" || true)"
 other="$(grep -c . <<<"${updates}" || true)"

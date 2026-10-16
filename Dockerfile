@@ -18,6 +18,7 @@ ARG FLUX_IMAGE_VERSION=dev
 # February 2026 build. libgl1-mesa-dri: the software renderer the world generation draws with.
 # python3, NOT python3-minimal: fluxck.py needs json and zipfile.
 RUN apt-get update -y && \
+    apt-get upgrade -y --no-install-recommends && \
     apt-get install -y --no-install-recommends \
         ca-certificates curl procps tzdata python3 \
         xvfb libxi6 libatomic1 libpulse0 libgl1-mesa-dri && \

@@ -107,6 +107,11 @@ Admins.json back as it stops (measured), so an edit made under it would be undon
 
 ## Versions
 
+- **1.0.3** (2026-10-16): the image applies Ubuntu's pending updates when it is built (`apt-get
+  upgrade`), so a rebuild clears what the published image was missing; the base is pinned to the
+  digest the build resolved and recorded in `org.opencontainers.image.base.digest`. The scheduled
+  CI run publishes only when something is waiting (an urgent security update now, anything else
+  on the first Monday of the month), since every new `:latest` restarts every server.
 - **1.0.2** (2026-10-11): backups skipped when one is under an hour old and kept by age (a crash
   loop can no longer rotate every good one away), made with Python's tarfile, with the reason in
   `backups/index.json`; `flux-ck backups` / `restore`; a game update that did not install is not
