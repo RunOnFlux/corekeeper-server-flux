@@ -1,10 +1,11 @@
 name: Test, build and publish
 
 # The game is not in the image (SteamCMD installs it on the first start), so there is no upstream
-# release to follow: a push to main publishes, and the weekly run rebuilds on a patched
-# steamcmd/steamcmd base. Publishing :latest DOES reach running servers: FluxOS's image update
-# service checks every app's tag every six hours and soft-redeploys onto a new image. Hence the
-# image test before the push.
+# release to follow: a push to main publishes. Publishing :latest DOES reach running servers:
+# FluxOS's image update service checks every app's tag every six hours and soft-redeploys onto a
+# new image, which restarts the server with no warning in game. Hence the image test before the
+# push, and the check before a scheduled build: it publishes only when there is something to apply
+# (.github/ci/needs-rebuild.sh), since even a rebuild of unchanged inputs gets a new digest.
 
 on:
   push:
@@ -12,7 +13,8 @@ on:
       - main
   pull_request:
   schedule:
-    # Mondays: the base image's security updates and a current SteamCMD, same scripts.
+    # Mondays: a check, and a build only when needs-rebuild.sh finds something to apply (an urgent
+    # security update now, anything else on the first Monday of the month).
     - cron: '0 6 * * 1'
   workflow_dispatch:
 
@@ -32,7 +34,7 @@ jobs:
 
       # Pinned, so "shellcheck is clean on my machine" means the same thing here.
       - name: Shellcheck
-        run: docker run --rm -v "$PWD:/mnt" -w /mnt koalaman/shellcheck:stable -x scripts/*.sh tests/*.sh tests/image/*.sh
+        run: docker run --rm -v "$PWD:/mnt" -w /mnt koalaman/shellcheck:stable -x scripts/*.sh tests/*.sh tests/image/*.sh .github/ci/*.sh
 
       - name: Unit tests
         run: ./tests/test-flux.sh
@@ -40,10 +42,31 @@ jobs:
       - name: Version is a version
         run: grep -Eqx '[0-9]+\.[0-9]+\.[0-9]+' VERSION
 
-  build:
-    needs: test
-    # A pull request gets the tests and nothing else: it must not publish.
+  # Is there anything to publish? Always yes for a push or a manual run; for the scheduled run, see
+  # .github/ci/needs-rebuild.sh. Also resolves the base digest the build pins.
+  check:
     if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    outputs:
+      build: ${{ steps.check.outputs.build }}
+      base: ${{ steps.check.outputs.base }}
+      base_digest: ${{ steps.check.outputs.base_digest }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: docker/setup-buildx-action@v3
+
+      - id: check
+        run: |
+          base="$(sed -n 's/^ARG BASE_IMAGE=//p' Dockerfile)"
+          echo "base=${base}" >>"$GITHUB_OUTPUT"
+          .github/ci/needs-rebuild.sh "${IMAGE_NAME}" "${base}"
+
+  build:
+    needs: [test, check]
+    # A pull request gets the tests and nothing else: it must not publish. A scheduled run with
+    # nothing new stops at the check.
+    if: github.event_name != 'pull_request' && needs.check.outputs.build == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
@@ -68,11 +91,14 @@ jobs:
           load: true
           build-args: |
             FLUX_IMAGE_VERSION=${{ env.VERSION }}
+            BASE_IMAGE=${{ needs.check.outputs.base }}@${{ needs.check.outputs.base_digest }}
           tags: ${{ env.IMAGE_NAME }}:${{ github.sha }}
           labels: |
             org.opencontainers.image.source=https://github.com/${{ github.repository }}
             org.opencontainers.image.revision=${{ github.sha }}
             org.opencontainers.image.version=${{ env.VERSION }}
+            org.opencontainers.image.base.name=${{ needs.check.outputs.base }}
+            org.opencontainers.image.base.digest=${{ needs.check.outputs.base_digest }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
 

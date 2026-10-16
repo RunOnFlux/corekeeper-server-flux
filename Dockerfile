@@ -5,7 +5,11 @@
 # the GPU), under a supervisor that writes the server's settings from the environment and the
 # hub's panel, saves on stop, follows game updates, restarts daily if asked, keeps backups, and
 # gives the hub a JSON status, the worlds, the admins and bans, and the mods. See README.md.
-FROM steamcmd/steamcmd:ubuntu-24
+# The base. CI builds it pinned to the digest it resolved and records that digest in the
+# org.opencontainers.image.base.digest label, which the scheduled check compares against
+# (.github/ci/needs-rebuild.sh).
+ARG BASE_IMAGE=steamcmd/steamcmd:ubuntu-24
+FROM ${BASE_IMAGE}
 
 ARG DEBIAN_FRONTEND=noninteractive
 ARG FLUX_IMAGE_VERSION=dev
