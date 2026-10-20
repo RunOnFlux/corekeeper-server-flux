@@ -44,6 +44,9 @@ ck() { python3 /opt/flux/fluxck.py "$@"; }
 
 rm -f "${FLUX_RESTART_MARKER}"
 mkdir -p "${s}" "${FLUX_GAME_DATA}" "${FLUX_MODS_DIR}" "${FLUX_STATE_DIR}" "${FLUX_GAME_LOG_DIR}"
+# An older image kept flux.log on the synced data volume: move it here, once.
+flux_log_migrate "${FLUX_STATE_DIR}/flux.log"
+flux_banner "Core Keeper"
 # Image 1.0.x kept the game's logs on the data volume; they are local now.
 rm -f "${FLUX_STATE_DIR}/current.log" 2>/dev/null
 rm -rf "${FLUX_STATE_DIR}/logs" 2>/dev/null
@@ -310,6 +313,7 @@ start_generation() {
     args+=(-port "${port}")
   fi
   ck state starting "Loading the world"
+  flux_banner "Core Keeper"
   flux_log "starting the server (generation ${generation}): ${args[*]}"
 
   # The game's log, onto the container's output.

@@ -13,8 +13,9 @@ on:
       - main
   pull_request:
   schedule:
-    # Mondays: a check, and a build only when needs-rebuild.sh finds something to apply (an urgent
-    # security update now, anything else on the first Monday of the month).
+    # Mondays: a check, and a build only when needs-rebuild.sh finds something to apply: an urgent
+    # security update, commits on main (touching the image inputs) the published image does not have,
+    # or, on the first Monday of the month, anything else.
     - cron: '0 6 * * 1'
   workflow_dispatch:
 
@@ -53,6 +54,9 @@ jobs:
       base_digest: ${{ steps.check.outputs.base_digest }}
     steps:
       - uses: actions/checkout@v5
+        with:
+          # The check compares the published image's revision label with this history.
+          fetch-depth: 0
 
       - uses: docker/setup-buildx-action@v3
 

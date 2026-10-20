@@ -26,7 +26,7 @@ that:
 | Path | Flux mount | What |
 |---|---|---|
 | `/mnt/corekeeper/data` | `g:` (synced) | `DedicatedServer/` (the server's `-datapath`: ServerConfig.json, Admins.json, PlayerBans.json, `worlds/<0-29>.world.gzip`, `worldgenparams/`), `Mods/` (the mods that are on), `Mods.disabled/` (the ones switched off: the game loads every folder in `Mods/`, whatever its name) and `flux/` (our log, state, settings, backups) |
-| `/mnt/corekeeper/server` | `ml:server` (local) | the game install, about 570 MB. Downloaded again on a new node |
+| `/mnt/corekeeper/server` | `ml:server` (local) | the game install, about 570 MB, the game's logs and our `flux-logs/flux.log` (5 MB, one `.1`). Downloaded again on a new node |
 
 Spec: `g:/mnt/corekeeper/data|ml:server:/mnt/corekeeper/server`.
 
@@ -107,6 +107,7 @@ Admins.json back as it stops (measured), so an edit made under it would be undon
 
 ## Versions
 
+- **1.0.4** (2026-10-20): flux.log moved off the synced data volume to `flux-logs/flux.log` on the local install volume (5 MB, one `.1` rotated copy; an old one on the data volume is appended there once and deleted); the FluxCloud start-up banner at container start and on every server generation; the scheduled build runs on Mondays and publishes only for an urgent security update or commits the published image does not have.
 - **1.0.3** (2026-10-16): the image applies Ubuntu's pending updates when it is built (`apt-get
   upgrade`), so a rebuild clears what the published image was missing; the base is pinned to the
   digest the build resolved and recorded in `org.opencontainers.image.base.digest`. The scheduled

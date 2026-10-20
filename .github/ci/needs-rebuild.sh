@@ -18,7 +18,10 @@
 # restart every server every week again. So:
 #   now           a security update is waiting in the published image for a package the server
 #                 really runs on (URGENT below: the C library, TLS, certificates, curl, Python for
-#                 the supervisor, zlib, the C++ runtime, Wine, .NET)
+#                 the supervisor, zlib, the C++ runtime)
+#   pending       commits on main since the published :latest (its org.opencontainers.image.revision
+#                 label) that touch the image inputs (Dockerfile, VERSION, every file the Dockerfile
+#                 COPYs): a change that is not published yet
 #   monthly       anything else, on the first Monday of the month: the base image moved since the
 #                 published :latest (its digest differs from the org.opencontainers.image.base.digest
 #                 label), or any other update is waiting
@@ -41,17 +44,20 @@ if [ "${GITHUB_EVENT_NAME:-}" != "schedule" ]; then
 fi
 
 # Packages whose security updates are applied the same week.
-URGENT='^(libc6|libc-bin|libssl[0-9a-z.]*|openssl|ca-certificates|curl|libcurl[0-9a-z.-]*|libgnutls[0-9a-z.]*|libnghttp2-[0-9a-z]*|zlib1g|python3(\.[0-9]+)?(-minimal)?|libpython3(\.[0-9]+)?(-minimal|-stdlib)?|libstdc\+\+6|libgcc-s1|wine[a-z0-9-]*|winehq[a-z0-9-]*|dotnet[a-z0-9.-]*|aspnetcore[a-z0-9.-]*)(:[a-z0-9]+)?$'
+URGENT='^(libc6|libc-bin|libssl[0-9a-z.]*|openssl|ca-certificates|curl|libcurl[0-9a-z.-]*|libgnutls[0-9a-z.]*|libnghttp2-[0-9a-z]*|zlib1g|python3(\.[0-9]+)?(-minimal)?|libpython3(\.[0-9]+)?(-minimal|-stdlib)?|libstdc\+\+6|libgcc-s1)(:[a-z0-9]+)?$'
 monthly=false
 [ "$(date -u +%d)" -le 7 ] && monthly=true
 
 now=()
 later=()
 
-# The label of the published image (one platform, or the amd64 entry of a multi-platform one).
-recorded="$(docker buildx imagetools inspect "${image}:latest" --format '{{json .Image}}' 2>/dev/null \
-  | jq -r 'if has("config") then . else ([to_entries[] | select(.key | test("amd64")) | .value][0] // {}) end
-           | .config.Labels["org.opencontainers.image.base.digest"] // empty' || true)"
+# A label of the published image (one platform, or the amd64 entry of a multi-platform one).
+published_label() {
+  docker buildx imagetools inspect "${image}:latest" --format '{{json .Image}}' 2>/dev/null \
+    | jq -r --arg k "$1" 'if has("config") then . else ([to_entries[] | select(.key | test("amd64")) | .value][0] // {}) end
+                          | .config.Labels[$k] // empty' || true
+}
+recorded="$(published_label org.opencontainers.image.base.digest)"
 if [ -z "${recorded}" ]; then
   echo "the published ${image}:latest records no base digest (built before this check)"
   later+=("the base digest of the published image is not recorded")
@@ -60,6 +66,41 @@ elif [ "${recorded}" != "${base_digest}" ]; then
 else
   echo "the base has not moved since the published image"
 fi
+
+# Commits on main the published image does not have (the pending rule above).
+head_sha="$(git rev-parse HEAD)"
+revision="$(published_label org.opencontainers.image.revision)"
+pending=false
+inputs=(Dockerfile VERSION)
+while read -r line; do
+  read -ra words <<<"${line}"
+  words=("${words[@]:1}")
+  sources=()
+  for w in "${words[@]}"; do
+    [[ "${w}" == --* ]] || sources+=("${w}")
+  done
+  unset 'sources[${#sources[@]}-1]'
+  inputs+=("${sources[@]}")
+# (A COPY continued with a trailing backslash is joined first.)
+done < <(sed -e ':a' -e '/\\$/{N;s/\\\n/ /;ba}' Dockerfile | grep -E '^(COPY|ADD)[[:space:]]' | grep -v -- '--from=' || true)
+if [ -z "${revision}" ]; then
+  pending=true
+  now+=("the published image records no revision (built before this check): pending")
+elif [ "${revision}" = "${head_sha}" ]; then
+  echo "the published image was built from HEAD (${head_sha:0:12})"
+elif ! git cat-file -e "${revision}^{commit}" 2>/dev/null; then
+  pending=true
+  now+=("the published revision ${revision:0:12} is not in this checkout's history: pending")
+else
+  ahead="$(git rev-list --count "${revision}..${head_sha}" -- "${inputs[@]}")"
+  if [ "${ahead}" -gt 0 ]; then
+    pending=true
+    now+=("${ahead} commit(s) since the published ${revision:0:12} touch the image inputs (${inputs[*]})")
+  else
+    echo "no commit since the published ${revision:0:12} touches the image inputs (${inputs[*]})"
+  fi
+fi
+echo "pending=${pending}"
 
 # Updates the published image is missing, as root (the image may run as another user).
 # "Inst <package> [<installed>] (<candidate> <origin> ..." per package.

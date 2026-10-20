@@ -63,3 +63,4 @@ A change to what the image does bumps `VERSION` and gets a line under "Versions"
 - **The world file is not gzip** despite `.world.gzip`. Opaque: copied, never parsed.
 - **GameInfo.txt / GameID.txt land in the install directory**, next to the executable.
 - **Flux stops a container with Docker's default 10 seconds.** SIGTERM save: 3.4-3.9 s measured.
+- **flux.log is local** (`${FLUX_SERVER_DIR}/flux-logs/flux.log`, 5 MB + one `.1`, on the `ml:` mount), never the synced data volume. `flux_log_migrate` moves an older `flux/flux.log` there once. `entrypoint` creates the dir explicitly. The start-up banner is `flux_banner "<game>"` (container start and every generation); keep its text.

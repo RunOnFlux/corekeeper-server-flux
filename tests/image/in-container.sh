@@ -110,5 +110,13 @@ check "a stop ends the supervisor" "0" "$(status wait_for '! kill -0 ${entry} 2>
 check "and saves the world" "0" "$(status test -f ${data}/DedicatedServer/worlds/4.world.gzip)"
 check "and says stopped" "stopped" "$(python3 -c 'import json;print(json.load(open("'"${data}"'/flux/state.json"))["state"])')"
 
+# --- flux.log is local; the banner ----------------------------------------------------------------
+logf=/mnt/corekeeper/server/flux-logs/flux.log
+check "flux.log is on the install volume" "0" "$(status test -s "${logf}")"
+check "and not on the synced data volume" "1" "$(status test -e "${data}/flux/flux.log")"
+check "the banner is in the container output" "0" "$(status grep -q 'Core Keeper server image by FluxCloud - https://runonflux.com' /tmp/entry.log)"
+check "and in flux.log" "0" "$(status grep -q 'Host this and 30+ other games in one click: https://runonflux.com/games' "${logf}")"
+check "at the container start and again for each generation" "1" "$([ "$(grep -c 'server image by FluxCloud' /tmp/entry.log)" -ge 2 ] && echo 1 || echo 0)"
+
 printf '\n%d passed, %d failed\n' "${pass}" "${fail}"
 [ "${fail}" = "0" ] || { echo '--- entrypoint log'; cat /tmp/entry.log; exit 1; }
