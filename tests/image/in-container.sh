@@ -107,7 +107,9 @@ check "a safety backup was made first" "0" "$(status grep -q 'before restoring' 
 wait_for 'grep -q "\"running\"" ${data}/flux/state.json' 20
 kill -TERM "${entry}"
 check "a stop ends the supervisor" "0" "$(status wait_for '! kill -0 ${entry} 2>/dev/null' 20)"
-check "and saves the world" "0" "$(status test -f ${data}/DedicatedServer/worlds/4.world.gzip)"
+# The restore cleared the panel's world pick (1.0.5), so the third start was on the backup's own world (slot 0).
+check "and saves the world" "0" "$(status test -f ${data}/DedicatedServer/worlds/0.world.gzip)"
+check "the restore dropped the panel's world pick (the config is back on slot 0)" "0" "$(python3 -c 'import json;print(json.load(open("'"${data}"'/DedicatedServer/ServerConfig.json")).get("world"))')"
 check "and says stopped" "stopped" "$(python3 -c 'import json;print(json.load(open("'"${data}"'/flux/state.json"))["state"])')"
 
 # --- flux.log is local; the banner ----------------------------------------------------------------
