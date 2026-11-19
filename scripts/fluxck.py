@@ -482,7 +482,7 @@ def apply_admins(notes):
     if bans_data is not None:
         bans_data["banList"] = bans
         write_json(bans_path, bans_data)
-    if edits is not None:
+    if edits is not None or os.path.exists(ADMIN_EDITS_FILE):  # a pending file that is not an object goes too
         try:
             os.remove(ADMIN_EDITS_FILE)
         except OSError:
@@ -903,6 +903,9 @@ def cmd_set_admins(raw):
     clean = read_json(ADMIN_EDITS_FILE, {}) or {}
     if not isinstance(clean, dict):
         clean = {}
+    # Whatever an old or edited file holds, only lists of keys stay.
+    clean = {k: [x for x in v if isinstance(x, str)] for k, v in clean.items()
+             if k in ("admins", "bans", "addAdmins", "removeAdmins", "addBans", "removeBans") and isinstance(v, list)}
     for name in ("admins", "bans"):
         if name not in edits:
             continue
