@@ -69,6 +69,7 @@ STATE_FILE = os.path.join(STATE_DIR, "state.json")
 SETTINGS_FILE = os.path.join(STATE_DIR, "settings.json")
 ADMIN_EDITS_FILE = os.path.join(STATE_DIR, "admins-pending.json")
 SEEN_FILE = os.path.join(STATE_DIR, "players-seen.json")
+ANSWER_MAX = 28000  # bytes `admins` may answer with (the exec's limit is 32 KiB)
 SEEN_ANSWER = 150  # of them, what `admins` answers with
 SEEN_MAX = 300  # players remembered by name; the oldest go first
 # The game's log is on the INSTALL volume (local to the node, never synced): Core Keeper writes
@@ -425,8 +426,8 @@ def apply_list(entries, wanted, privileges, label, notes):
 def apply_ops(entries, add, remove, privileges, label, notes):
     """The panel's changes to a list as differences: keys to add and keys to remove. What the game
     wrote to the list meanwhile (a ban in game) stays; only what the owner changed is changed."""
-    add = [str(k) for k in (add or []) if key_ok(k)]
-    remove = {str(k) for k in (remove or []) if key_ok(k)}
+    add = [str(k) for k in (add if isinstance(add, list) else []) if key_ok(k)]
+    remove = {str(k) for k in (remove if isinstance(remove, list) else []) if key_ok(k)}
     if not add and not remove:
         return entries
     kept = [e for e in entries if entry_key(e) not in remove]
@@ -651,7 +652,7 @@ def remember_players(players):
         for fname, key in (("Admins.json", "adminList"), ("PlayerBans.json", "banList")):
             data = read_json(os.path.join(GAME_DATA, fname), {}) or {}
             for e in (data.get(key) or []) if isinstance(data, dict) else []:
-                listed.add(entry_key(e))
+                listed.add(ban_id(e) if key == "banList" else entry_key(e))
         newest = sorted(seen, key=lambda k: -seen[k].get("lastSeen", 0))[:SEEN_MAX]
         seen = {k: v for k, v in seen.items() if k in newest or k in listed}
     try:
@@ -867,15 +868,26 @@ def cmd_admins():
                 "kind": "steam" if key and not key.startswith("cp:") else ("crossplatform" if key else "unknown"),
                 "seenName": (seen.get(key or "") or {}).get("name")}
 
-    out({
-        "admins": [row(a) for a in admins if isinstance(a, dict)],
+    rows = [row(a) for a in admins if isinstance(a, dict)]
+    for r in rows:
+        if r.get("seenName") is None or r.get("seenName") == r.get("name"):
+            r.pop("seenName", None)  # the same name twice is bytes the answer cannot spare
+    answer = {
+        "admins": rows,
         "bans": [{"id": ban_id(b), "name": (b.get("name") if isinstance(b, dict) else None) or (seen.get(str(ban_id(b))) or {}).get("name"),
                   "kind": row(b)["kind"] if isinstance(b, dict) else "unknown"} for b in bans],
-        # The answer must stay under the 32 KiB the exec returns: the newest players only.
-        "seen": [{"id": k, **v} for k, v in sorted(seen.items(), key=lambda kv: -kv[1].get("lastSeen", 0))[:SEEN_ANSWER]],
         "ops": True,
         "pending": read_json(ADMIN_EDITS_FILE),
-    })
+    }
+    newest = [{"id": k, **v} for k, v in sorted(seen.items(), key=lambda kv: -kv[1].get("lastSeen", 0))]
+    # The exec answers at most 32 KiB: the newest players that fit, whatever their names are made of.
+    count = min(len(newest), SEEN_ANSWER)
+    while True:
+        answer["seen"] = newest[:count]
+        if count == 0 or len(json.dumps(answer, ensure_ascii=False).encode("utf-8")) <= ANSWER_MAX:
+            break
+        count = count * 3 // 4
+    out(answer)
 
 
 def cmd_set_admins(raw):
@@ -889,6 +901,8 @@ def cmd_set_admins(raw):
     if not isinstance(edits, dict):
         fail("expected a JSON object")
     clean = read_json(ADMIN_EDITS_FILE, {}) or {}
+    if not isinstance(clean, dict):
+        clean = {}
     for name in ("admins", "bans"):
         if name not in edits:
             continue
@@ -898,6 +912,9 @@ def cmd_set_admins(raw):
         if bad:
             fail(f"not a SteamID64 (17 digits starting 7656119) or cp:<id>: {', '.join(bad)}", 2)
         clean[name] = list(dict.fromkeys(str(steam_id(x)) if steam_id(x) else str(x).strip() for x in edits[name]))
+        # A whole list replaces the differences pending for it (an older panel sends these).
+        for stale in (("addAdmins", "removeAdmins") if name == "admins" else ("addBans", "removeBans")):
+            clean.pop(stale, None)
     # Differences (1.0.5): add/remove per list, merged into what is already pending; adding a key
     # cancels a pending removal of it and the other way round.
     for add_name, remove_name in (("addAdmins", "removeAdmins"), ("addBans", "removeBans")):
@@ -913,6 +930,7 @@ def cmd_set_admins(raw):
             continue
         add = [str(steam_id(x)) if steam_id(x) else str(x).strip() for x in edits.get(add_name, [])]
         remove = [str(steam_id(x)) if steam_id(x) else str(x).strip() for x in edits.get(remove_name, [])]
+        remove = [k for k in remove if k not in add]  # asked to add and remove one key at once: the add stands
         now_add = [k for k in clean.get(add_name, []) if k not in remove] + [k for k in add if k not in clean.get(add_name, [])]
         now_remove = [k for k in clean.get(remove_name, []) if k not in add] + [k for k in remove if k not in clean.get(remove_name, [])]
         clean[add_name] = list(dict.fromkeys(now_add))
@@ -1286,9 +1304,13 @@ def cmd_do_restore():
         # The panel's choice of world slot, and of mode and seed for a world it was about to create,
         # would be applied on top of the restored ServerConfig.json and start another world than the
         # one the backup was playing. The restored files decide; password and game id stay as set.
+        # Only when the backup brought a ServerConfig.json to take its place: without one the apply would
+        # start from the defaults (world 0). A content-bundle request made for the old world is dropped too.
         settings = load_settings()
-        if any(k in settings for k in ("world", "worldMode", "seed")):
-            for k in ("world", "worldMode", "seed"):
+        restored_config = isinstance(read_json(os.path.join(GAME_DATA, "ServerConfig.json")), dict)
+        drop = ("world", "worldMode", "seed", "activateAllContent") if restored_config else ("worldMode", "seed", "activateAllContent")
+        if any(k in settings for k in drop):
+            for k in drop:
                 settings.pop(k, None)
             write_json(SETTINGS_FILE, settings)
         try:
