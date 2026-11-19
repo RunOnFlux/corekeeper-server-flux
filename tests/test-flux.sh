@@ -257,6 +257,36 @@ check "the restore puts the world back" "w0" "$(cat "${data}/DedicatedServer/wor
 check "after a safety backup" "1" "$(grep -c 'before restoring' "${tmp}/restore")"
 check "and it is no longer pending" "1" "$(status test -e "${data}/flux/restore-pending.json")"
 
+# Restore must not start another world than the backup was playing (a panel Play or Create left the
+# world slot, mode and seed in settings.json; the apply put them back over the restored config).
+ck set-settings '{"world": 3, "worldMode": "Casual", "seed": "abc", "password": "keepme"}' >/dev/null
+ck restore "${first}" >/dev/null
+ck do-restore >/dev/null
+check "a restore drops the panel's world pick, mode and seed" "None None None" "$(python3 -c 'import json,sys;d=json.load(open(sys.argv[1]));print(d.get("world"),d.get("worldMode"),d.get("seed"))' "${data}/flux/settings.json")"
+check "and keeps the password" "keepme" "$(jget "${data}/flux/settings.json" password)"
+
+# The panel's changes as differences: what the game wrote meanwhile stays.
+printf '{"banList": [{"steamId": 76561198000000020, "name": "ingame-ban", "index": 1}]}' >"${data}/DedicatedServer/PlayerBans.json"
+ck set-admins '{"addBans": ["76561198000000021"], "addAdmins": ["76561198000000022"]}' >/dev/null
+ck apply >/dev/null
+check "a ban made in game survives a panel edit" "76561198000000020 76561198000000021" "$(python3 -c 'import json,sys;print(" ".join(str(b["steamId"]) for b in json.load(open(sys.argv[1]))["banList"]))' "${data}/DedicatedServer/PlayerBans.json")"
+ck set-admins '{"removeBans": ["76561198000000021"]}' >/dev/null
+ck set-admins '{"addBans": ["76561198000000021"]}' >/dev/null
+check "adding a key cancels its pending removal" "[]" "$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1])).get("removeBans"))' "${data}/flux/admins-pending.json")"
+ck set-admins '{"removeBans": ["76561198000000020"]}' >/dev/null
+ck apply >/dev/null
+check "a removal takes only that ban" "76561198000000021" "$(python3 -c 'import json,sys;print(" ".join(str(b["steamId"]) for b in json.load(open(sys.argv[1]))["banList"]))' "${data}/DedicatedServer/PlayerBans.json")"
+check "the answer says it speaks differences" "True" "$(ck admins | python3 -c 'import json,sys;print(json.load(sys.stdin)["ops"])')"
+check "a bad key in a difference is refused" "2" "$(status ck set-admins '{"removeBans": ["x"]}')"
+
+# players-seen is capped, and the answer of `admins` stays far under 32 KiB.
+PYTHONPATH=scripts FLUX_DATA_DIR="${data}" python3 -c '
+import fluxck as c, json
+c.remember_players([{"id": str(3200000000 + i), "name": "Player Number %d" % i} for i in range(900)])
+print(len(json.load(open(c.SEEN_FILE))))' >"${tmp}/seen"
+check "the players remembered are capped" "300" "$(cat "${tmp}/seen")"
+check "and the answer carries the newest 150" "150" "$(ck admins | python3 -c 'import json,sys;print(len(json.load(sys.stdin)["seen"]))')"
+
 # Failed updates: a target that did not install is skipped for 6 hours.
 mkdir -p "${tmp}/server/steamapps" && printf '"AppState"\n{\n\t"buildid"\t\t"100"\n}\n' >"${tmp}/server/steamapps/appmanifest_1963720.acf"
 ck update-target 200

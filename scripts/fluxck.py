@@ -69,6 +69,8 @@ STATE_FILE = os.path.join(STATE_DIR, "state.json")
 SETTINGS_FILE = os.path.join(STATE_DIR, "settings.json")
 ADMIN_EDITS_FILE = os.path.join(STATE_DIR, "admins-pending.json")
 SEEN_FILE = os.path.join(STATE_DIR, "players-seen.json")
+SEEN_ANSWER = 150  # of them, what `admins` answers with
+SEEN_MAX = 300  # players remembered by name; the oldest go first
 # The game's log is on the INSTALL volume (local to the node, never synced): Core Keeper writes
 # leak warnings into it for as long as it runs, and on the synced data volume that was steady
 # Syncthing traffic and a log that could fill the plan's disk.
@@ -420,6 +422,25 @@ def apply_list(entries, wanted, privileges, label, notes):
     return kept
 
 
+def apply_ops(entries, add, remove, privileges, label, notes):
+    """The panel's changes to a list as differences: keys to add and keys to remove. What the game
+    wrote to the list meanwhile (a ban in game) stays; only what the owner changed is changed."""
+    add = [str(k) for k in (add or []) if key_ok(k)]
+    remove = {str(k) for k in (remove or []) if key_ok(k)}
+    if not add and not remove:
+        return entries
+    kept = [e for e in entries if entry_key(e) not in remove]
+    have = {entry_key(e) for e in kept}
+    added = 0
+    for key in add:
+        if key not in have and steam_id(key):
+            kept.append(new_entry(key, kept, privileges))
+            have.add(key)
+            added += 1
+    notes.append(f"{label} from the panel: {added} added, {len(entries) - (len(kept) - added)} removed")
+    return kept
+
+
 def apply_admins(notes):
     """CK_ADMINS (SteamID64s, comma separated) are made admins; the panel's pending edits are
     applied. Admins added in game are kept: the variable adds, it never removes."""
@@ -441,6 +462,8 @@ def apply_admins(notes):
     if edits and isinstance(edits.get("admins"), list):
         wanted = [str(k) for k in edits["admins"] if key_ok(k)]
         admins = apply_list(admins, wanted, 2, "admins", notes)
+    if edits:
+        admins = apply_ops(admins, edits.get("addAdmins"), edits.get("removeAdmins"), 2, "admins", notes)
     for raw in (os.environ.get("CK_ADMINS") or "").replace(";", ",").split(","):
         sid = steam_id(raw)
         if sid and str(sid) not in {entry_key(a) for a in admins}:
@@ -449,6 +472,8 @@ def apply_admins(notes):
     if edits and isinstance(edits.get("bans"), list):
         wanted = [str(k) for k in edits["bans"] if key_ok(k)]
         bans = apply_list(bans, wanted, None, "bans", notes)
+    if edits:
+        bans = apply_ops(bans, edits.get("addBans"), edits.get("removeBans"), None, "bans", notes)
 
     if data is not None:
         data["adminList"] = admins
@@ -620,6 +645,15 @@ def remember_players(players):
         entry = seen.get(p["id"], {})
         entry.update({"name": p["name"], "lastSeen": now})
         seen[p["id"]] = entry
+    if len(seen) > SEEN_MAX:
+        # Newest first; the ones on the admin or ban lists are always kept (their names are shown).
+        listed = set()
+        for fname, key in (("Admins.json", "adminList"), ("PlayerBans.json", "banList")):
+            data = read_json(os.path.join(GAME_DATA, fname), {}) or {}
+            for e in (data.get(key) or []) if isinstance(data, dict) else []:
+                listed.add(entry_key(e))
+        newest = sorted(seen, key=lambda k: -seen[k].get("lastSeen", 0))[:SEEN_MAX]
+        seen = {k: v for k, v in seen.items() if k in newest or k in listed}
     try:
         write_json(SEEN_FILE, seen, indent=None)
     except OSError:
@@ -836,8 +870,10 @@ def cmd_admins():
     out({
         "admins": [row(a) for a in admins if isinstance(a, dict)],
         "bans": [{"id": ban_id(b), "name": (b.get("name") if isinstance(b, dict) else None) or (seen.get(str(ban_id(b))) or {}).get("name"),
-                  "kind": row(b)["kind"] if isinstance(b, dict) else "unknown", "raw": big_ints_as_str(b)} for b in bans],
-        "seen": [{"id": k, **v} for k, v in sorted(seen.items(), key=lambda kv: -kv[1].get("lastSeen", 0))],
+                  "kind": row(b)["kind"] if isinstance(b, dict) else "unknown"} for b in bans],
+        # The answer must stay under the 32 KiB the exec returns: the newest players only.
+        "seen": [{"id": k, **v} for k, v in sorted(seen.items(), key=lambda kv: -kv[1].get("lastSeen", 0))[:SEEN_ANSWER]],
+        "ops": True,
         "pending": read_json(ADMIN_EDITS_FILE),
     })
 
@@ -862,6 +898,25 @@ def cmd_set_admins(raw):
         if bad:
             fail(f"not a SteamID64 (17 digits starting 7656119) or cp:<id>: {', '.join(bad)}", 2)
         clean[name] = list(dict.fromkeys(str(steam_id(x)) if steam_id(x) else str(x).strip() for x in edits[name]))
+    # Differences (1.0.5): add/remove per list, merged into what is already pending; adding a key
+    # cancels a pending removal of it and the other way round.
+    for add_name, remove_name in (("addAdmins", "removeAdmins"), ("addBans", "removeBans")):
+        for name in (add_name, remove_name):
+            if name not in edits:
+                continue
+            if not isinstance(edits[name], list):
+                fail(f"{name} must be a list", 2)
+            bad = [str(x) for x in edits[name] if not key_ok(x)]
+            if bad:
+                fail(f"not a SteamID64 (17 digits starting 7656119) or cp:<id>: {', '.join(bad)}", 2)
+        if add_name not in edits and remove_name not in edits:
+            continue
+        add = [str(steam_id(x)) if steam_id(x) else str(x).strip() for x in edits.get(add_name, [])]
+        remove = [str(steam_id(x)) if steam_id(x) else str(x).strip() for x in edits.get(remove_name, [])]
+        now_add = [k for k in clean.get(add_name, []) if k not in remove] + [k for k in add if k not in clean.get(add_name, [])]
+        now_remove = [k for k in clean.get(remove_name, []) if k not in add] + [k for k in remove if k not in clean.get(remove_name, [])]
+        clean[add_name] = list(dict.fromkeys(now_add))
+        clean[remove_name] = list(dict.fromkeys(now_remove))
     write_json(ADMIN_EDITS_FILE, clean)
     out({"ok": True, "pending": clean, "appliesOn": "restart"})
 
@@ -1228,6 +1283,18 @@ def cmd_do_restore():
             os.replace(GAME_DATA, old)
         os.replace(os.path.join(staging, os.path.basename(GAME_DATA)), GAME_DATA)
         shutil.rmtree(old, ignore_errors=True)
+        # The panel's choice of world slot, and of mode and seed for a world it was about to create,
+        # would be applied on top of the restored ServerConfig.json and start another world than the
+        # one the backup was playing. The restored files decide; password and game id stay as set.
+        settings = load_settings()
+        if any(k in settings for k in ("world", "worldMode", "seed")):
+            for k in ("world", "worldMode", "seed"):
+                settings.pop(k, None)
+            write_json(SETTINGS_FILE, settings)
+        try:
+            os.remove(ADMIN_EDITS_FILE)  # edits made against the lists that were just replaced
+        except OSError:
+            pass
         print(f"# restored {name}")
     except (OSError, tarfile.TarError, ValueError) as e:
         print(f"# WARN restore of {name} failed ({e}); nothing changed")
